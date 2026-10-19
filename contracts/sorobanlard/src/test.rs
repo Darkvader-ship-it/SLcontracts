@@ -7127,6 +7127,101 @@ fn test_platform_counter_decrements_on_refund() {
     assert_eq!(client.get_total_active_enrollments(), 2);
 }
 
+/// Stress the global counter with many sequential enrollments across many
+/// courses, then exercise both decrement paths (completion and refund). The
+/// final value is compared against an independently computed expectation and
+/// against the sum of every course's own `active_enrollments`.
+///
+/// Soroban executes invocations one at a time, so this also serves as the
+/// regression test for the race-freedom argument in the module docs: no
+/// increment is lost even though every call reads and writes the same single
+/// instance-storage key.
+#[test]
+fn test_stress_total_active_enrollments_sequential() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    const COURSE_COUNT: u32 = 6;
+    const STUDENT_COUNT: u32 = 8;
+    const COMPLETED_PER_COURSE: u32 = 2;
+    let price = 1_000_000i128;
+
+    let mut courses: std::vec::Vec<String> = std::vec::Vec::new();
+    for i in 0..COURSE_COUNT {
+        let course_id = format!("COURSE-STRESS-{:03}", i);
+        register_and_approve_course(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            &course_id,
+            price,
+        );
+        courses.push(String::from_str(&env, &course_id));
+    }
+
+    let token_client = token::StellarAssetClient::new(&env, &token_id);
+    let mut students: std::vec::Vec<Address> = std::vec::Vec::new();
+    for _ in 0..STUDENT_COUNT {
+        let student = Address::generate(&env);
+        token_client.mint(&student, &(price * COURSE_COUNT as i128));
+        students.push(student);
+    }
+
+    // Enroll every student in every course, one invocation at a time.
+    for student in students.iter() {
+        for course_id in courses.iter() {
+            client.enroll(student, course_id);
+        }
+    }
+
+    let total_enrollments = COURSE_COUNT * STUDENT_COUNT;
+    assert_eq!(
+        client.get_total_active_enrollments(),
+        total_enrollments,
+        "counter must equal the number of sequential enrollments"
+    );
+    for course_id in courses.iter() {
+        let course = client.get_course(course_id).unwrap();
+        assert_eq!(course.total_enrollments, STUDENT_COUNT);
+        assert_eq!(course.active_enrollments, STUDENT_COUNT);
+    }
+
+    // Complete the first students in every course.
+    for course_id in courses.iter() {
+        for student in students.iter().take(COMPLETED_PER_COURSE as usize) {
+            client.mark_completed(
+                &admin,
+                student,
+                course_id,
+                &Some(String::from_str(&env, "stress-evidence")),
+            );
+        }
+    }
+
+    // Refund one remaining enrollment to exercise the second decrement path.
+    let refunded_student = students.last().unwrap();
+    let refunded_course = courses.first().unwrap();
+    client.request_refund(refunded_student, refunded_course);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, refunded_student, refunded_course, &true);
+
+    let expected_active = total_enrollments - (COURSE_COUNT * COMPLETED_PER_COURSE) - 1;
+    assert_eq!(
+        client.get_total_active_enrollments(),
+        expected_active,
+        "counter must reflect enrollments minus completions minus refunds"
+    );
+
+    // Independent cross-check: the sum of the per-course counters must match.
+    let mut summed_active = 0u32;
+    for course_id in courses.iter() {
+        summed_active += client.get_course(course_id).unwrap().active_enrollments;
+    }
+    assert_eq!(summed_active, expected_active);
+}
+
 // ============================================================
 // MARK COMPLETED COURSE STATE VALIDATION TESTS (#129)
 // ============================================================
@@ -10778,6 +10873,159 @@ fn test_resolve_arbitration_payout_to_instructor() {
 
     let case = client.get_arbitration_case(&student, &course_id).unwrap();
     assert_eq!(case.status, DisputeStatus::ResolvedForInstructor);
+}
+
+/// Escalation is not student-only: a course instructor can open a case through
+/// the same entry point. This confirms the policy documented in the
+/// dispute-system module docs.
+#[test]
+fn test_instructor_can_escalate_arbitration() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let _student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-INSTRUCTOR", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-INSTRUCTOR");
+
+    // Instructor earnings are pull-based, so fund the fee directly.
+    token::StellarAssetClient::new(&env, &token_id).mint(&instructor, &fee_per_case);
+    let token_client = token::Client::new(&env, &token_id);
+    let balance_before = token_client.balance(&instructor);
+
+    client.escalate_to_arbitration(&instructor, &course_id);
+
+    assert_eq!(
+        balance_before - token_client.balance(&instructor),
+        fee_per_case,
+        "the instructor must pay the same escalation fee as a student"
+    );
+
+    let case = client
+        .get_arbitration_case(&instructor, &course_id)
+        .expect("instructor escalation must create a retrievable case");
+    assert_eq!(case.caller, instructor);
+    assert_eq!(case.instructor, instructor);
+    assert_eq!(case.status, DisputeStatus::Open);
+}
+
+/// The timeout is enforced at the exact boundary: a claim one ledger early is
+/// rejected, and the claim at `opened_at + timeout` refunds the full fee to the
+/// escalating caller and emits `arbitration_auto_refunded`.
+#[test]
+fn test_arbitration_timeout_boundary_auto_refunds_caller() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-TIMEOUT", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-TIMEOUT");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout = client.get_arbitration_timeout_ledgers();
+    assert_eq!(
+        timeout,
+        SorobanLardContract::ARBITRATION_TIMEOUT_LEDGERS,
+        "getter must expose the constant used by the contract"
+    );
+    let timeout_at = case.opened_at_ledger + timeout;
+
+    // One ledger before the timeout: the caller cannot force the refund yet.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at - 1;
+    });
+    assert!(
+        client
+            .try_claim_arbitration_timeout(&student, &course_id)
+            .is_err(),
+        "timeout claim must fail before the boundary"
+    );
+
+    // At the boundary the claim succeeds and refunds the full fee.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let token_client = token::Client::new(&env, &token_id);
+    let balance_before = token_client.balance(&student);
+    client.claim_arbitration_timeout(&student, &course_id);
+
+    // Read the event before any other contract call: Soroban's test host
+    // keeps only the events emitted by the most recent invocation.
+    let (event_caller, event_course, event_fee, event_ledger): (Address, String, i128, u32) =
+        last_event_val(&env, &contract_id, "arbitration_auto_refunded")
+            .try_into_val(&env)
+            .unwrap();
+    assert_eq!(event_caller, student);
+    assert_eq!(event_course, course_id);
+    assert_eq!(event_fee, fee_per_case);
+    assert_eq!(event_ledger, timeout_at);
+
+    let balance_after = token_client.balance(&student);
+    assert_eq!(
+        balance_after - balance_before,
+        fee_per_case,
+        "timeout claim must refund the full arbitration fee"
+    );
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    assert_eq!(case.status, DisputeStatus::AutoRefunded);
+}
+
+/// After the timeout an admin can no longer resolve the case, so the caller's
+/// auto-refund cannot be front-run by a late instructor-favoured ruling.
+#[test]
+#[should_panic(expected = "arbitration case has timed out; use claim_arbitration_timeout")]
+fn test_resolve_arbitration_after_timeout_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-LATE", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-LATE");
+
+    client.escalate_to_arbitration(&student, &course_id);
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout_at = case.opened_at_ledger + client.get_arbitration_timeout_ledgers();
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(&admin, &student, &course_id, &false);
+}
+
+/// A resolved case cannot be settled a second time through the timeout path.
+#[test]
+#[should_panic(expected = "arbitration case is not open")]
+fn test_arbitration_timeout_cannot_claim_resolved_case() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-SETTLED", fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-SETTLED");
+
+    client.escalate_to_arbitration(&student, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(&admin, &student, &course_id, &true);
+
+    let case = client.get_arbitration_case(&student, &course_id).unwrap();
+    let timeout_at = case.opened_at_ledger + client.get_arbitration_timeout_ledgers();
+    env.ledger().with_mut(|l| {
+        l.sequence_number = timeout_at;
+    });
+    client.claim_arbitration_timeout(&student, &course_id);
 }
 
 // ============================================================

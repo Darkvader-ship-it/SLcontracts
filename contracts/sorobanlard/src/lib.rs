@@ -97,6 +97,64 @@
 //! - A compromised single admin key cannot upgrade the contract — both admin signatures
 //!   are required for every step, and the time-lock gives observers a chance to react to
 //!   a malicious proposal before it can take effect.
+//!
+//! ## Storage Tiers
+//!
+//! Contract state is split across two Soroban storage tiers:
+//!
+//! - **Instance storage** — small, singleton, or hot configuration values
+//!   (`Admin`, `Treasury`, fee config, pause flag, global counters). These
+//!   share the contract instance's rent/TTL and are extended by most write
+//!   paths, so they stay available for the lifetime of the contract.
+//! - **Persistent storage** — per-entity records and unbounded collections
+//!   (`Course`, `Enrollment`, `Certificate`, earnings, waitlists, history).
+//!   Each entry has its own rent/TTL, is extended on access, and is the only
+//!   tier that can grow without bound.
+//!
+//! Rule of thumb for a new `DataKey`: **singleton config, auth flag, or global
+//! counter → instance; per-course / per-student / per-instructor record or
+//! append-only list → persistent.** The full classification of every current
+//! key is in `docs/storage-keys.md`.
+//!
+//! ## Platform Active Enrollment Counter
+//!
+//! `TotalActiveEnrollments` is one instance-storage `u32` mutated by
+//! `enroll`, `batch_enroll`, `re_enroll`, `mark_completed`, `process_refund`,
+//! and `archive_course`. It is safe without compare-and-swap because Soroban
+//! serializes contract execution: a transaction's contract invocations run
+//! one at a time against a single ledger snapshot, and any concurrent-looking
+//! transactions are ordered by consensus into separate ledgers. Within one
+//! invocation the read-increment-write sequence is uninterrupted, and a panic
+//! rolls the whole invocation (including the counter write) back. There is
+//! therefore no stale-read interleaving where two enrollments both read the
+//! same value and lose an increment. See the
+//! `test_stress_total_active_enrollments_sequential` regression test.
+//!
+//! ## Dispute Resolution & Arbitration
+//!
+//! `escalate_to_arbitration` records an `ArbitrationCase` and pulls the
+//! configured fee into the contract. Escalation is intentionally **not**
+//! restricted to enrolled students: any authenticated address may open a case,
+//! including a student and the course instructor. This gives instructors the
+//! same recourse as students; the contract does not adjudicate the underlying
+//! refund or certificate decision, it only holds the fee until the case is
+//! resolved.
+//!
+//! A case is opened as `DisputeStatus::Open`. There are two ways it can leave
+//! that state:
+//!
+//! 1. An admin calls `resolve_arbitration` before the timeout, choosing whether
+//!    the fee goes to the escalating caller (`for_student = true`) or to the
+//!    course instructor (`for_student = false`).
+//! 2. If no admin resolves within `ARBITRATION_TIMEOUT_LEDGERS` (~1 day), any
+//!    address may call `claim_arbitration_timeout`. The fee is refunded to the
+//!    escalating party and the case becomes `DisputeStatus::AutoRefunded`.
+//!    This is a permissionless "auto-refund" trigger: Soroban contracts cannot
+//!    schedule their own execution, so the timeout is enforced by rejecting
+//!    late admin resolutions and letting anyone settle the case.
+//!
+//! Both resolution paths emit an event (`arbitration_resolved` /
+//! `arbitration_auto_refunded`) so off-chain indexers can reconcile the pool.
 
 #![no_std]
 
@@ -149,6 +207,9 @@ pub enum DisputeStatus {
     ResolvedForStudent,
     /// Admin ruled in favour of the instructor (fee paid to instructor).
     ResolvedForInstructor,
+    /// No admin resolved the case within the arbitration timeout, so the fee
+    /// was automatically refunded to the escalating party.
+    AutoRefunded,
 }
 
 /// A persistent record of an arbitration case created by `escalate_to_arbitration`.
@@ -157,7 +218,9 @@ pub enum DisputeStatus {
 pub struct ArbitrationCase {
     /// Unique case identifier (student address + course_id).
     pub case_id: String,
-    /// The student / caller who escalated the dispute.
+    /// The address that escalated the dispute. Escalation is not restricted
+    /// by role, so this may be a student or the course instructor. The fee is
+    /// refunded to this address when the student wins or the case times out.
     pub caller: Address,
     /// The course this dispute concerns.
     pub course_id: String,
@@ -658,6 +721,12 @@ impl SorobanLardContract {
     const MAX_CATEGORIES: u32 = 10;
     /// Maximum length of a category name in characters (#165)
     const MAX_CATEGORY_LEN: u32 = 64;
+    /// Ledgers an arbitration case may remain `Open` before the arbitration
+    /// fee can be permissionlessly refunded to the escalating party. This is
+    /// the admin-resolution SLA: after this many ledgers of inactivity the
+    /// case can no longer be resolved by an admin and must be auto-refunded
+    /// instead (~17,280 ledgers ≈ 1 day at 5s/ledger).
+    pub(crate) const ARBITRATION_TIMEOUT_LEDGERS: u32 = 17_280;
 
     // ----------------------------------------------------------
     // INIT
@@ -5736,7 +5805,13 @@ impl SorobanLardContract {
     /// Escalate a dispute to arbitration. The caller must pay the
     /// arbitration fee (set via `set_arbitration_fee_config`).
     /// The fee is transferred from the caller to the contract and held
-    /// until the arbitration is resolved.
+    /// until the arbitration is resolved or the timeout auto-refunds it.
+    ///
+    /// Escalation is open to any authenticated caller. The contract does not
+    /// require the caller to be an enrolled student, so course instructors can
+    /// use the same mechanism (see the dispute-system module docs). `caller`
+    /// is recorded as the party entitled to a refund if they win or the case
+    /// times out.
     pub fn escalate_to_arbitration(env: Env, caller: Address, course_id: String) {
         caller.require_auth();
 
@@ -5815,7 +5890,13 @@ impl SorobanLardContract {
     /// - `for_student = true`  — refund the fee to the original caller (student won).
     /// - `for_student = false` — transfer the fee to the course instructor (instructor won).
     ///
-    /// Panics if the case does not exist or is not `Open`.
+    /// Admin resolution is only allowed while the case is within its SLA (fewer
+    /// than `ARBITRATION_TIMEOUT_LEDGERS` since it was opened). Once the timeout
+    /// has elapsed the fee belongs to the escalating party and must be settled
+    /// with `claim_arbitration_timeout`; a late admin resolution panics so an
+    /// admin cannot deny the caller the timeout refund.
+    ///
+    /// Panics if the case does not exist, is not `Open`, or has timed out.
     pub fn resolve_arbitration(
         env: Env,
         admin: Address,
@@ -5838,6 +5919,10 @@ impl SorobanLardContract {
 
         if case.status != DisputeStatus::Open {
             panic!("arbitration case is not open");
+        }
+
+        if env.ledger().sequence() >= Self::arbitration_timeout_at(&case) {
+            panic!("arbitration case has timed out; use claim_arbitration_timeout");
         }
 
         let token_client = token::Client::new(&env, &case.token);
@@ -5871,6 +5956,77 @@ impl SorobanLardContract {
             (Symbol::new(&env, "arbitration_resolved"), course_id.clone()),
             (caller, course_id, for_student, admin),
         );
+    }
+
+    /// Permissionlessly settle an arbitration case whose admin-resolution SLA
+    /// (`ARBITRATION_TIMEOUT_LEDGERS`) has elapsed.
+    ///
+    /// The full fee is refunded to the address that originally escalated the
+    /// case and the status becomes `DisputeStatus::AutoRefunded`. This function
+    /// intentionally requires no auth: any party (the escalating student, the
+    /// course instructor, or an observer) can trigger the refund, which always
+    /// goes to `case.caller`. Soroban cannot schedule contract execution on its
+    /// own, so this permissionless call is how the timeout is enforced.
+    ///
+    /// Panics if the case does not exist, is not `Open`, or the timeout has not
+    /// yet elapsed.
+    pub fn claim_arbitration_timeout(env: Env, caller: Address, course_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
+
+        let case_key = ArbitrationCaseKey { caller: caller.clone(), course_id: course_id.clone() };
+        let mut case: ArbitrationCase = env
+            .storage()
+            .persistent()
+            .get(&case_key)
+            .unwrap_or_else(|| panic!("arbitration case not found"));
+
+        if case.status != DisputeStatus::Open {
+            panic!("arbitration case is not open");
+        }
+
+        if env.ledger().sequence() < Self::arbitration_timeout_at(&case) {
+            panic!("arbitration timeout has not elapsed");
+        }
+
+        let token_client = token::Client::new(&env, &case.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &case.caller,
+            &case.fee_paid,
+        );
+
+        case.status = DisputeStatus::AutoRefunded;
+        env.storage().persistent().set(&case_key, &case);
+        env.storage().persistent().extend_ttl(
+            &case_key,
+            Self::PERSISTENT_TTL_THRESHOLD,
+            Self::PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "arbitration_auto_refunded"), course_id.clone()),
+            (
+                case.caller.clone(),
+                course_id,
+                case.fee_paid,
+                env.ledger().sequence(),
+            ),
+        );
+    }
+
+    /// Returns the admin-resolution SLA for arbitration cases, in ledgers.
+    pub fn get_arbitration_timeout_ledgers(_env: Env) -> u32 {
+        Self::ARBITRATION_TIMEOUT_LEDGERS
+    }
+
+    /// Ledger at which an open arbitration case becomes eligible for the
+    /// timeout auto-refund. Saturating arithmetic keeps a malformed/overflowing
+    /// `opened_at_ledger` from wrapping into an early refund.
+    fn arbitration_timeout_at(case: &ArbitrationCase) -> u32 {
+        case.opened_at_ledger
+            .saturating_add(Self::ARBITRATION_TIMEOUT_LEDGERS)
     }
 
     /// Complete a payment with a risk assessment.

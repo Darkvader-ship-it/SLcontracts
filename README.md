@@ -45,6 +45,7 @@ This is **Repo 1 of 3** in the SorobanLard project:
 
 - [What the Contract Does](#what-the-contract-does)
 - [What Lives Off-Chain](#what-lives-off-chain)
+- [Storage Tiers](#storage-tiers)
 - [Architecture](#architecture)
 - [Data Structures](#data-structures)
 - [Contract Functions](#contract-functions)
@@ -96,6 +97,21 @@ The contract intentionally stores only what is necessary for payments and verifi
 | Instructor analytics | — |
 
 This keeps the contract small, cheap to call, and focused on what blockchains are actually good at: verifiable ownership, trustless payments, and permanent records.
+
+---
+
+## Storage Tiers
+
+The contract uses Soroban **instance** storage for singleton config, auth flags,
+and global counters, and **persistent** storage for per-entity records and
+append-only collections. The rule of thumb for new keys is:
+
+> Singleton config / auth flag / global counter → instance.
+> Per-course / per-student / per-instructor record or list → persistent.
+
+Every current `DataKey` / `DataKey2` variant is classified in
+[docs/storage-keys.md](docs/storage-keys.md), along with the rationale and the
+race-freedom argument for `TotalActiveEnrollments`.
 
 ---
 
@@ -291,6 +307,9 @@ Returns `true` if the certificate exists and has not been revoked. The `get_cert
 | `certificate_revoked` | `certificate_id` | Certificate revoked |
 | `course_certificates_revoked` | `(admin, course_id, revoked_count, ledger)` | All certificates of a course bulk-revoked |
 | `admin_transferred` | `new_admin` | Admin role transferred |
+| `dispute_escalated` | `(caller, course_id, fee)` | Arbitration case opened |
+| `arbitration_resolved` | `(caller, course_id, for_student, admin)` | Admin resolved an open case |
+| `arbitration_auto_refunded` | `(caller, course_id, fee, ledger)` | Case timed out; fee refunded to the escalating caller |
 
 The backend listens to these events and updates the database, sends notifications, and triggers email confirmations.
 
